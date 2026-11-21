@@ -1,0 +1,17 @@
+{
+  "root": "/home/dev/feedback/uid31483",
+  "B": "/home/dev/feedback/uid31483",
+  "sha": "c21ce0cbe2789c71e70e2138c558492305d0e344",
+  "wslDistro": "Ubuntu-26.04",
+  "source": {
+    "owner": "dirkjanm",
+    "repo": "mitm6",
+    "sha": "c21ce0cbe2789c71e70e2138c558492305d0e344"
+  },
+  "fork": {
+    "owner": "Rrr119",
+    "repo": "mitm6",
+    "cloneUrl": "https://github.com/Rrr119/mitm6.git"
+  },
+  "at": "2026-11-21T08:34:18.203Z"
+}

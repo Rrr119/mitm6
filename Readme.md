@@ -19,7 +19,8 @@ After installation, mitm6 will be available as a command line program called `mi
 
 ```
 usage: mitm6 [-h] [-i INTERFACE] [-l LOCALDOMAIN] [-4 ADDRESS] [-6 ADDRESS] [-m ADDRESS] [-a] [-r TARGET] [-v] [--debug]
-             [-d DOMAIN] [-b DOMAIN] [-hw DOMAIN] [-hb DOMAIN] [--ignore-nofqdn]
+             [-d DOMAIN] [-b DOMAIN] [-hw DOMAIN] [-hb DOMAIN] [--ignore-nofqdn] [--ou OU] [--ou-blocklist OU] [--ou-file FILE]
+             [--lease-time SECONDS] [--dns-server ADDRESS] [--restore-timeout SECONDS] [--no-restore]
 
 mitm6 - pwning IPv4 via IPv6
 For help or reporting issues, visit https://github.com/dirkjanm/mitm6
@@ -52,12 +53,52 @@ Filtering options:
   -hb DOMAIN, --host-blocklist DOMAIN, --host-blacklist DOMAIN
                         Hostname (FQDN) to filter DHCPv6 queries on (Blocklist principle, multiple can be specified.)
   --ignore-nofqdn       Ignore DHCPv6 queries that do not contain the Fully Qualified Domain Name (FQDN) option.
+  --ou OU               Organizational Unit to filter DHCPv6 queries on (Allowlist principle, multiple can be specified. Requires an OU map file.)
+  --ou-blocklist OU     Organizational Unit to filter DHCPv6 queries on (Blocklist principle, multiple can be specified.)
+  --ou-file FILE        JSON file mapping OU names to hostname patterns (default: ou_map.json in current directory)
+
+Takeover and restoration options:
+  --lease-time SECONDS  DHCPv6 lease time in seconds (default: 300)
+  --dns-server ADDRESS  Upstream DNS server used to resolve real records during restoration (default: system resolver)
+  --restore-timeout SECONDS
+                        Maximum time in seconds to restore the original DNS state after interruption (default: 30)
+  --no-restore          Do not restore the original network state on shutdown
 ```
 
 You can manually override most of the autodetect options (though overriding the MAC address will break things). If the network has some hardware which blocks or detects rogue Router Advertisement messages, you can add the `--no-ra` flag to not broadcast those. Router Advertisements are not needed for mitm6 to work since it relies mainly on DHCPv6 messages.
 
 ### Filtering options
 Several filtering options are available to select which hosts you want to attack and spoof. First there are the `--host-allowlist` and `--host-blocklist` options (or `-hw` and `-hb` for short), which take a (partial) domain as argument. Incoming DHCPv6 requests will be filtered against this list. The property checked is the DHCPv6 FQND option, in which the client provides its hostname. 
+
+#### OU filtering
+Since DHCPv6 messages do not carry Organizational Unit information, OU membership is resolved through a hostname-pattern map. Create a JSON file (default `ou_map.json`, override with `--ou-file`) mapping OU names to (partial) hostname patterns, for example:
+
+```json
+{
+  "SALES": [".sales.corp.local"],
+  "IT": [".it.corp.local", "srv-"]
+}
+```
+
+Then use `--ou SALES` to only target hosts in the SALES OU (allowlist principle), or `--ou-blocklist IT` to exclude the IT OU. OU filtering can be combined with the hostname allowlist/blocklist.
+
+### Lease time and restoration
+The DHCPv6 lease time handed out to targets can be controlled with `--lease-time` (default 300 seconds); renewal timers T1/T2 are derived from it (0.5x and 0.8x the lease time).
+
+While running, mitm6 keeps a journal of every lease it handed out and every DNS record it spoofed. On shutdown (for example after Ctrl+C), it restores the original network state within `--restore-timeout` seconds (default 30):
+
+1. Every leased IPv6 address is deprecated by sending the client a DHCPv6 reply with lifetime 0.
+2. Every spoofed DNS record is re-resolved against the real DNS server (`--dns-server`, or the system resolver by default) and the correct record is pushed to the affected clients with a low TTL.
+
+Restoration can be disabled with `--no-restore`. Note that the corrected DNS responses are a best-effort cache correction; clients will also recover on their own once the spoofed records' TTLs expire.
+
+### Running the tests
+A simulation test suite covering 100 virtual hosts (OU/hostname filtering, lease times, and restoration within the 30 second budget) is included:
+
+```
+pip install pytest
+python -m pytest tests/
+```
 The same applies for DNS requests, for this the `--domain` option (or `-d`) is available, where you can supply which domain(s) you want to spoof. Blocking specific domains is also possible with `--blocklist`/`-b`. Both parameters can be specified multiple times to include/block multiple domains (for example `-d domain.local -d otherdomain.local -b somehost.domain.local -b somehost.otherdomain.local`).
 
 For both the host and DNS filtering, simple string matching is performed. So if you choose to reply to `wpad`, it will also reply to queries for `wpad.corpdomain.com`. If you want more specific filtering, use both the allowlist and blocklist options, since the blocklist takes precedence over the allowlist.

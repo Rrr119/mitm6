@@ -1,0 +1,5 @@
+{
+  "SALES": [".sales.corp.local"],
+  "IT": [".it.corp.local", "srv-"],
+  "EXEC": ["exec-", ".exec.corp.local"]
+}

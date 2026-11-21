@@ -1,5 +1,5 @@
 from __future__ import unicode_literals
-from scapy.all import sniff, ls, ARP, IPv6, DNS, DNSRR, Ether, conf, IP, UDP, DNSRRSOA
+from scapy.all import sniff, ls, ARP, IPv6, DNS, DNSQR, DNSRR, Ether, conf, IP, UDP, DNSRRSOA, sr1
 from twisted.internet import reactor
 from twisted.internet.protocol import ProcessProtocol, DatagramProtocol
 from scapy.layers.dhcp6 import *
@@ -16,6 +16,7 @@ import sys
 import argparse
 import socket
 import builtins
+import time
 
 # Globals
 pcdict = {}
@@ -83,8 +84,31 @@ class Config(object):
         # Hostname (DHCPv6 FQDN) allowlist / blocklist options
         self.host_allowlist = [d.lower() for d in args.host_allowlist]
         self.host_blocklist = [d.lower() for d in args.host_blocklist]
+        # OU allowlist / blocklist options. Since DHCPv6 messages do not carry
+        # OU information, OU membership is resolved via a hostname-pattern map
+        self.ou_allowlist = [ou.upper() for ou in args.ou]
+        self.ou_blocklist = [ou.upper() for ou in args.ou_blocklist]
+        self.ou_map = {}
+        ou_file = args.ou_file if args.ou_file else 'ou_map.json'
+        try:
+            with open(ou_file, 'r') as oumapfile:
+                self.ou_map = dict((ou.upper(), [p.lower() for p in patterns])
+                                   for ou, patterns in json.load(oumapfile).items())
+        except IOError:
+            if args.ou_file:
+                print('Warning: OU map file %s could not be read, OU filtering disabled' % ou_file)
+        except ValueError:
+            print('Warning: OU map file %s is not valid JSON, OU filtering disabled' % ou_file)
         # Should DHCPv6 queries that do not specify a FQDN be ignored?
         self.ignore_nofqdn = args.ignore_nofqdn
+        # DHCPv6 lease time in seconds
+        self.lease_time = args.lease_time
+        # DNS restoration options
+        self.dns_server = args.dns_server
+        self.restore_timeout = args.restore_timeout
+        self.no_restore = args.no_restore
+        # Optional hook (mainly for testing) to resolve real DNS records
+        self.resolver = None
         # Local domain to advertise
         # If no localdomain is specified, use the first dnsdomain
         if args.localdomain is None:
@@ -124,6 +148,33 @@ class Target(object):
     def __repr__(self):
         return '<Target %s>' % self.__str__()
 
+# Journal of everything mitm6 spoofed, so the original network state can be
+# restored on shutdown
+class SpoofJournal(object):
+    def __init__(self):
+        # (qname, qtype) -> {client_ip: (client_mac, set of source ports)}
+        self.dns_records = {}
+        # mac -> lease info dict
+        self.leases = {}
+
+    def record_dns(self, qname, qtype, client_ip, client_mac, client_port):
+        key = (qname.lower(), qtype)
+        clients = self.dns_records.setdefault(key, {})
+        if client_ip not in clients:
+            clients[client_ip] = (client_mac, set())
+        clients[client_ip][1].add(client_port)
+
+    def record_lease(self, mac, client_ip, duid, iaid, addr, target):
+        self.leases[mac] = {
+            'client_ip': client_ip,
+            'duid': duid,
+            'iaid': iaid,
+            'addr': addr,
+            'target': target,
+        }
+
+journal = SpoofJournal()
+
 def get_fqdn(dhcp6packet):
     try:
         fqdn = dhcp6packet[DHCP6OptClientFQDN].fqdn
@@ -150,9 +201,11 @@ def send_dhcp_advertise(p, basep, target):
     else:
         addr = config.ipv6prefix + '%d:%d' % (config.ipv6noaddr, config.ipv6noaddrc)
         config.ipv6noaddrc += 1
-    opt = DHCP6OptIAAddress(preflft=300, validlft=300, addr=addr)
-    resp /= DHCP6OptIA_NA(ianaopts=[opt], T1=200, T2=250, iaid=p[DHCP6OptIA_NA].iaid)
+    opt = DHCP6OptIAAddress(preflft=config.lease_time, validlft=config.lease_time, addr=addr)
+    resp /= DHCP6OptIA_NA(ianaopts=[opt], T1=int(config.lease_time * 0.5), T2=int(config.lease_time * 0.8), iaid=p[DHCP6OptIA_NA].iaid)
     sendp(resp, iface=config.default_if, verbose=False)
+    journal.record_lease(target.mac, basep[IPv6].src, p[DHCP6OptClientId].duid,
+                         p[DHCP6OptIA_NA].iaid, addr, target)
 
 def send_dhcp_reply(p, basep):
     resp = Ether(dst=basep.src)/IPv6(src=config.selfaddr, dst=basep[IPv6].src)/UDP(sport=547, dport=546) #base packet
@@ -165,8 +218,13 @@ def send_dhcp_reply(p, basep):
         resp /= DHCP6OptDNSDomains(dnsdomains=[config.localdomain])
     try:
         opt = p[DHCP6OptIAAddress]
-        resp /= DHCP6OptIA_NA(ianaopts=[opt], T1=200, T2=250, iaid=p[DHCP6OptIA_NA].iaid)
+        opt.preflft = config.lease_time
+        opt.validlft = config.lease_time
+        resp /= DHCP6OptIA_NA(ianaopts=[opt], T1=int(config.lease_time * 0.5), T2=int(config.lease_time * 0.8), iaid=p[DHCP6OptIA_NA].iaid)
         sendp(resp, iface=config.default_if, verbose=False)
+        target = get_target(basep)
+        journal.record_lease(basep.src, basep[IPv6].src, p[DHCP6OptClientId].duid,
+                             p[DHCP6OptIA_NA].iaid, opt.addr, target)
     except IndexError:
         # Some hosts don't send back this layer for some reason, ignore those
         if config.debug or config.verbose:
@@ -224,6 +282,7 @@ def send_dns_reply(p):
         resp /= DNS(id=dns.id, qr=1, qd=dns.qd, an=DNSRR(rrname=dns.qd.qname, ttl=100, rdata=rdata, type=dns.qd.qtype))
         try:
             sendp(resp, iface=config.default_if, verbose=False)
+            journal.record_dns(reqname, dns.qd.qtype, ip.src, p.src, ip.sport)
         except socket.error as e:
             print('Error sending spoofed DNS')
             print(e)
@@ -241,6 +300,14 @@ def matches_list(value, target_list):
         if test in testvalue:
             return True
     return False
+
+# Look up which OU a hostname belongs to, based on the OU hostname-pattern map
+def get_host_ou(hostname):
+    testvalue = hostname.lower()
+    for ou, patterns in config.ou_map.items():
+        if matches_list(testvalue, patterns):
+            return ou
+    return None
 
 # Should we spoof the queried name?
 def should_spoof_dns(dnsname):
@@ -267,6 +334,17 @@ def should_spoof_dhcpv6(fqdn):
         if config.debug:
             print('Ignoring DHCPv6 packet from %s: FQDN matches blocklist ' % fqdn)
         return False
+    # OU based filtering
+    if config.ou_allowlist or config.ou_blocklist:
+        ou = get_host_ou(fqdn)
+        if config.ou_allowlist and ou not in config.ou_allowlist:
+            if config.debug:
+                print('Ignoring DHCPv6 packet from %s: host OU (%s) not in OU allowlist ' % (fqdn, ou))
+            return False
+        if ou is not None and ou in config.ou_blocklist:
+            if config.debug:
+                print('Ignoring DHCPv6 packet from %s: host OU (%s) matches OU blocklist ' % (fqdn, ou))
+            return False
     return True
 
 # Get a target object if it exists, otherwise, create it
@@ -308,6 +386,96 @@ def parsepacket(p):
         if p.dst == config.selfmac:
             send_dns_reply(p)
 
+# Resolve the real DNS record for a spoofed name, used during restoration.
+# Returns the rdata string or None if it could not be resolved in time.
+def resolve_real_record(qname, qtype, timeout):
+    if config.resolver is not None:
+        return config.resolver(qname, qtype)
+    name = qname[:-1] if qname.endswith('.') else qname
+    if config.dns_server:
+        try:
+            query = IP(dst=config.dns_server)/UDP(dport=53)/DNS(rd=1, qd=DNSQR(qname=qname, qtype=qtype))
+            ans = sr1(query, verbose=False, timeout=timeout)
+            if ans is not None and DNS in ans and ans[DNS].ancount > 0:
+                for i in range(ans[DNS].ancount):
+                    rr = ans[DNS].an[i] if ans[DNS].ancount > 1 else ans[DNS].an
+                    if rr.type == qtype:
+                        return rr.rdata
+        except (socket.error, OSError):
+            return None
+        return None
+    try:
+        family = socket.AF_INET if qtype == 1 else socket.AF_INET6
+        if qtype not in (1, 28):
+            return None
+        return socket.getaddrinfo(name, None, family)[0][4][0]
+    except (socket.gaierror, IndexError, UnicodeError, socket.herror):
+        return None
+
+# Send a DHCPv6 reply with lifetime 0 to deprecate an address we handed out
+def send_lease_deprecate(mac, lease):
+    resp = Ether(dst=mac)/IPv6(src=config.selfaddr, dst=lease['client_ip'])/UDP(sport=547, dport=546)
+    resp /= DHCP6_Reply(trid=random.randint(0, 0xffffff))
+    resp /= DHCP6OptClientId(duid=lease['duid'])
+    resp /= DHCP6OptServerId(duid=config.selfduid)
+    opt = DHCP6OptIAAddress(preflft=0, validlft=0, addr=lease['addr'])
+    resp /= DHCP6OptIA_NA(ianaopts=[opt], T1=0, T2=0, iaid=lease['iaid'])
+    sendp(resp, iface=config.default_if, verbose=False)
+
+# Send a DNS response with the real record to a previously spoofed client
+def send_dns_restore(qname, qtype, rdata, client_ip, client_mac, client_port):
+    if ':' in client_ip:
+        resp = Ether(dst=client_mac, src=config.selfmac)/IPv6(src=config.selfaddr, dst=client_ip)/UDP(sport=53, dport=client_port)
+    else:
+        resp = Ether(dst=client_mac, src=config.selfmac)/IP(src=config.selfipv4, dst=client_ip)/UDP(sport=53, dport=client_port)
+    resp /= DNS(id=0, qr=1, qd=DNSQR(qname=qname, qtype=qtype),
+                an=DNSRR(rrname=qname, ttl=10, rdata=rdata, type=qtype))
+    sendp(resp, iface=config.default_if, verbose=False)
+
+# Restore the original network state: deprecate all leases we handed out and
+# push the real DNS records to spoofed clients. Guaranteed to return within
+# `timeout` seconds (default: config.restore_timeout, 30s).
+def restore_network(timeout=None):
+    if timeout is None:
+        timeout = config.restore_timeout
+    deadline = time.monotonic() + timeout
+    deprecated = 0
+    restored = 0
+    failed = 0
+    # 1. Deprecate all DHCPv6 leases handed out by us
+    for mac, lease in list(journal.leases.items()):
+        if time.monotonic() >= deadline:
+            break
+        try:
+            send_lease_deprecate(mac, lease)
+            deprecated += 1
+        except (socket.error, OSError) as e:
+            failed += 1
+            if config.debug:
+                print('Error deprecating lease for %s: %s' % (mac, e))
+    # 2. Restore the real DNS records at spoofed clients
+    for (qname, qtype), clients in list(journal.dns_records.items()):
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            break
+        rdata = resolve_real_record(qname, qtype, min(2.0, remaining))
+        if rdata is None:
+            failed += 1
+            print('Warning: could not resolve real record for %s, skipping restore' % qname)
+            continue
+        for client_ip, (client_mac, ports) in clients.items():
+            if time.monotonic() >= deadline:
+                break
+            for port in ports:
+                try:
+                    send_dns_restore(qname, qtype, rdata, client_ip, client_mac, port)
+                    restored += 1
+                except (socket.error, OSError) as e:
+                    failed += 1
+                    if config.debug:
+                        print('Error restoring DNS for %s at %s: %s' % (qname, client_ip, e))
+    return deprecated, restored, failed
+
 def setupFakeDns():
     # We bind to port 53 to prevent ICMP port unreachable packets being sent
     # actual responses are sent by scapy
@@ -341,6 +509,12 @@ def shutdownnotice():
     # print(arptable)
     with open('arp.cache','w') as arpcache:
         arpcache.write(json.dumps(arptable))
+    if not config.no_restore and (journal.leases or journal.dns_records):
+        print('Restoring original network state (max %d seconds)...' % config.restore_timeout)
+        start = time.monotonic()
+        deprecated, restored, failed = restore_network()
+        elapsed = time.monotonic() - start
+        print('Restoration finished in %.1fs: %d lease(s) deprecated, %d DNS record(s) restored, %d failed' % (elapsed, deprecated, restored, failed))
 
 def print_err(failure):
     print('An error occurred while sending a packet: %s\nNote that root privileges are required to run mitm6' % failure.getErrorMessage())
@@ -364,6 +538,15 @@ def main():
     filtergroup.add_argument("-hw", "-ha", "--host-allowlist", "--host-whitelist", action='append', default=[], metavar='DOMAIN', help="Hostname (FQDN) to filter DHCPv6 queries on (Allowlist principle, multiple can be specified.)")
     filtergroup.add_argument("-hb", "--host-blocklist", "--host-blacklist", action='append', default=[], metavar='DOMAIN', help="Hostname (FQDN) to filter DHCPv6 queries on (Blocklist principle, multiple can be specified.)")
     filtergroup.add_argument("--ignore-nofqdn", action='store_true', help="Ignore DHCPv6 queries that do not contain the Fully Qualified Domain Name (FQDN) option.")
+    filtergroup.add_argument("--ou", action='append', default=[], metavar='OU', help="Organizational Unit to filter DHCPv6 queries on (Allowlist principle, multiple can be specified. Requires an OU map file.)")
+    filtergroup.add_argument("--ou-blocklist", action='append', default=[], metavar='OU', help="Organizational Unit to filter DHCPv6 queries on (Blocklist principle, multiple can be specified.)")
+    filtergroup.add_argument("--ou-file", type=str, metavar='FILE', help="JSON file mapping OU names to hostname patterns (default: ou_map.json in current directory)")
+
+    takeovergroup = parser.add_argument_group("Takeover and restoration options")
+    takeovergroup.add_argument("--lease-time", type=int, default=300, metavar='SECONDS', help="DHCPv6 lease time in seconds (default: 300)")
+    takeovergroup.add_argument("--dns-server", type=str, metavar='ADDRESS', help="Upstream DNS server used to resolve real records during restoration (default: system resolver)")
+    takeovergroup.add_argument("--restore-timeout", type=int, default=30, metavar='SECONDS', help="Maximum time in seconds to restore the original DNS state after interruption (default: 30)")
+    takeovergroup.add_argument("--no-restore", action='store_true', help="Do not restore the original network state on shutdown")
 
     args = parser.parse_args()
     config = Config(args)
@@ -389,6 +572,15 @@ def main():
         print('Hostname allowlist: %s' % ', '.join(config.host_allowlist))
     if config.host_blocklist:
         print('Hostname blocklist: %s' % ', '.join(config.host_blocklist))
+    if config.ou_allowlist:
+        print('OU allowlist: %s' % ', '.join(config.ou_allowlist))
+    if config.ou_blocklist:
+        print('OU blocklist: %s' % ', '.join(config.ou_blocklist))
+    if (config.ou_allowlist or config.ou_blocklist) and not config.ou_map:
+        print('Warning: OU filtering specified but no OU map was loaded, no hosts will match the OU allowlist')
+    print('DHCPv6 lease time: %d seconds' % config.lease_time)
+    if not config.no_restore:
+        print('DNS restoration on shutdown: enabled (timeout %d seconds)' % config.restore_timeout)
 
     #Main packet capture thread
     d = threads.deferToThread(sniff, iface=config.default_if, filter="ip6 proto \\udp or arp or udp port 53", prn=lambda x: reactor.callFromThread(parsepacket, x), stop_filter=should_stop)
